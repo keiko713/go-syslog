@@ -220,6 +220,9 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 }
 
 func (s *Server) goScanConnection(connection net.Conn) {
+	if s.debugChannel != nil {
+		s.debugChannel <- fmt.Sprintf("goScanConnection called")
+	}
 	scanner := bufio.NewScanner(connection)
 	if sf := s.format.GetSplitFunc(); sf != nil {
 		scanner.Split(sf)
@@ -250,7 +253,11 @@ func (s *Server) goScanConnection(connection net.Conn) {
 			}
 		}
 		if s.debugChannel != nil {
-			s.debugChannel <- fmt.Sprintf("handshake went well with %s", client)
+			s.debugChannel <- fmt.Sprintf("goScanConnection: tls handshake went well with %s", client)
+		}
+	} else {
+		if s.debugChannel != nil {
+			s.debugChannel <- fmt.Sprintf("goScanConnection: none tls connection with %s", client)
 		}
 	}
 
