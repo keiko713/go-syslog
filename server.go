@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -41,9 +42,11 @@ type Server struct {
 	readTimeoutMilliseconds int64
 	tlsPeerNameFunc         TlsPeerNameFunc
 	datagramPool            sync.Pool
+	errChannel              chan error
+	debugChannel            chan string
 }
 
-//NewServer returns a new Server
+// NewServer returns a new Server
 func NewServer() *Server {
 	return &Server{tlsPeerNameFunc: defaultTlsPeerName, datagramPool: sync.Pool{
 		New: func() interface{} {
@@ -55,17 +58,27 @@ func NewServer() *Server {
 	}
 }
 
-//Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
+// Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
 func (s *Server) SetFormat(f format.Format) {
 	s.format = f
 }
 
-//Sets the handler, this handler with receive every syslog entry
+// Sets the handler, this handler with receive every syslog entry
 func (s *Server) SetHandler(handler Handler) {
 	s.handler = handler
 }
 
-//Sets the connection timeout for TCP connections, in milliseconds
+// Sets a channel for errors
+func (s *Server) SetErrChannel(c chan error) {
+	s.errChannel = c
+}
+
+// Sets a channel for debug message
+func (s *Server) SetDebugChannel(c chan string) {
+	s.debugChannel = c
+}
+
+// Sets the connection timeout for TCP connections, in milliseconds
 func (s *Server) SetTimeout(millseconds int64) {
 	s.readTimeoutMilliseconds = millseconds
 }
@@ -89,7 +102,7 @@ func defaultTlsPeerName(tlsConn *tls.Conn) (tlsPeer string, ok bool) {
 	return cn, true
 }
 
-//Configure the server for listen on an UDP addr
+// Configure the server for listen on an UDP addr
 func (s *Server) ListenUDP(addr string) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -106,7 +119,7 @@ func (s *Server) ListenUDP(addr string) error {
 	return nil
 }
 
-//Configure the server for listen on an unix socket
+// Configure the server for listen on an unix socket
 func (s *Server) ListenUnixgram(addr string) error {
 	unixAddr, err := net.ResolveUnixAddr("unixgram", addr)
 	if err != nil {
@@ -123,7 +136,7 @@ func (s *Server) ListenUnixgram(addr string) error {
 	return nil
 }
 
-//Configure the server for listen on a TCP addr
+// Configure the server for listen on a TCP addr
 func (s *Server) ListenTCP(addr string) error {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -140,7 +153,7 @@ func (s *Server) ListenTCP(addr string) error {
 	return nil
 }
 
-//Configure the server for listen on a TCP addr for TLS
+// Configure the server for listen on a TCP addr for TLS
 func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
 	listener, err := tls.Listen("tcp", addr, config)
 	if err != nil {
@@ -152,7 +165,7 @@ func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
 	return nil
 }
 
-//Starts the server, all the go routines goes to live
+// Starts the server, all the go routines goes to live
 func (s *Server) Boot() error {
 	if s.format == nil {
 		return errors.New("please set a valid format")
@@ -189,10 +202,17 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 			}
 			connection, err := listener.Accept()
 			if err != nil {
+				if s.errChannel != nil {
+					s.errChannel <- &ListenerError{err}
+				}
 				continue
+			} else {
+				if s.debugChannel != nil {
+					s.debugChannel <- fmt.Sprintf("successfully accepted connection from %s", connection.RemoteAddr())
+				}
 			}
 
-			s.goScanConnection(connection)
+			go s.goScanConnection(connection)
 		}
 
 		s.wait.Done()
@@ -215,6 +235,9 @@ func (s *Server) goScanConnection(connection net.Conn) {
 	if tlsConn, ok := connection.(*tls.Conn); ok {
 		// Handshake now so we get the TLS peer information
 		if err := tlsConn.Handshake(); err != nil {
+			if s.errChannel != nil {
+				s.errChannel <- &HandshakeError{err, remoteAddr, tlsConn.ConnectionState()}
+			}
 			connection.Close()
 			return
 		}
@@ -225,6 +248,9 @@ func (s *Server) goScanConnection(connection net.Conn) {
 				connection.Close()
 				return
 			}
+		}
+		if s.debugChannel != nil {
+			s.debugChannel <- fmt.Sprintf("handshake went well with %s", client)
 		}
 	}
 
@@ -249,6 +275,9 @@ loop:
 		if scanCloser.Scan() {
 			s.parser([]byte(scanCloser.Text()), client, tlsPeer)
 		} else {
+			if err := scanCloser.Err(); err != nil && s.errChannel != nil {
+				s.errChannel <- &ScannerError{err, client, tlsPeer}
+			}
 			break loop
 		}
 	}
@@ -262,6 +291,13 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 	err := parser.Parse()
 	if err != nil {
 		s.lastError = err
+		if s.errChannel != nil {
+			s.errChannel <- &ParserError{err}
+		}
+	} else {
+		if s.debugChannel != nil {
+			s.debugChannel <- fmt.Sprintf("Successfully parsed the line")
+		}
 	}
 
 	logParts := parser.Dump()
@@ -278,12 +314,12 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 	s.handler.Handle(logParts, int64(len(line)), err)
 }
 
-//Returns the last error
+// Returns the last error
 func (s *Server) GetLastError() error {
 	return s.lastError
 }
 
-//Kill the server
+// Kill the server
 func (s *Server) Kill() error {
 	for _, connection := range s.connections {
 		err := connection.Close()
@@ -308,7 +344,7 @@ func (s *Server) Kill() error {
 	return nil
 }
 
-//Waits until the server stops
+// Waits until the server stops
 func (s *Server) Wait() {
 	s.wait.Wait()
 }
@@ -383,4 +419,57 @@ func (s *Server) goParseDatagrams() {
 			}
 		}
 	}()
+}
+
+// Error types
+type ListenerError struct {
+	wrappedError error
+}
+
+func (l *ListenerError) Error() string {
+	return l.wrappedError.Error()
+}
+
+func (l *ListenerError) Unwrap() error {
+	return l.wrappedError
+}
+
+type HandshakeError struct {
+	wrappedError    error
+	RemoteAddr      net.Addr
+	ConnectionState tls.ConnectionState
+}
+
+func (l *HandshakeError) Error() string {
+	return l.wrappedError.Error()
+}
+
+func (l *HandshakeError) Unwrap() error {
+	return l.wrappedError
+}
+
+type ScannerError struct {
+	wrappedError error
+	Client       string
+	TLSPeer      string
+}
+
+func (l *ScannerError) Error() string {
+	return l.wrappedError.Error()
+}
+
+func (l *ScannerError) Unwrap() error {
+	return l.wrappedError
+}
+
+type ParserError struct {
+	wrappedError error
+}
+
+func (l *ParserError) Error() string {
+	return l.wrappedError.Error()
+}
+
+func (l *ParserError) Unwrap() error {
+	return l.wrappedError
 }
